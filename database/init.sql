@@ -1,0 +1,18 @@
+CREATE DATABASE IF NOT EXISTS supervision;
+USE supervision;
+
+CREATE TABLE IF NOT EXISTS variables (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    ip VARCHAR(50) NOT NULL,
+    register_address INT NOT NULL,
+    frequency INT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    variable_id INT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    value FLOAT NOT NULL,
+    FOREIGN KEY (variable_id) REFERENCES variables(id) ON DELETE CASCADE
+);

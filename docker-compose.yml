@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: tp2-mariadb
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: supervision
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./database:/docker-entrypoint-initdb.d
+      - mariadb_data:/var/lib/mysql
+
+  backend:
+    build: ./backend
+    container_name: tp2-backend
+    restart: always
+    environment:
+      DB_HOST: mariadb
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: supervision
+      DB_PORT: 3306
+    depends_on:
+      - mariadb
+    ports:
+      - "3000:3000"
+
+  frontend:
+    build: ./frontend
+    container_name: tp2-frontend
+    restart: always
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  mariadb_data:
