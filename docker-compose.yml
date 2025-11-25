@@ -14,6 +14,8 @@ services:
     volumes:
       - ./database:/docker-entrypoint-initdb.d
       - mariadb_data:/var/lib/mysql
+    networks:
+      - tp2-net
 
   backend:
     build: ./backend
@@ -25,19 +27,28 @@ services:
       DB_PASSWORD: root
       DB_NAME: supervision
       DB_PORT: 3306
+      PORT: 3000
     depends_on:
       - mariadb
     ports:
       - "3000:3000"
+    networks:
+      - tp2-net
 
   frontend:
     build: ./frontend
     container_name: tp2-frontend
     restart: always
-    ports:
-      - "8080:80"
     depends_on:
       - backend
+    ports:
+      - "8080:80"
+    networks:
+      - tp2-net
 
 volumes:
   mariadb_data:
+
+networks:
+  tp2-net:
+    driver: bridge

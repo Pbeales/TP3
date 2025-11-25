@@ -2,36 +2,38 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Supervision Process - TP</title>
+    <title>Supervision Process</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-
-    <!-- Bootstrap -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
-
-    <!-- Chart.js -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    >
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
     <style>
-        body { background: #f5f7fa; font-family: Arial; color: #222; }
+        body { background: #f5f7fa; font-family: Arial, sans-serif; color: #222; }
         h1, h3 { color: #1d4ed8; }
-        .container-box { background: white; padding: 20px; border-radius: 10px; margin-top: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .list-group-item { background: #f0f4ff; border: 1px solid #d8e3ff; }
+        .container-box {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .list-group-item {
+            background: #f0f4ff;
+            border: 1px solid #d8e3ff;
+        }
         .btn-primary { background: #1d4ed8; border: none; }
-        .btn-primary:hover { background: #173ea6; }
         .btn-danger { background: #dc2626; border: none; }
         .chart-container { height: 350px; }
     </style>
 </head>
-
 <body class="p-4">
 <div class="container">
-
     <h1 class="text-center mb-4">📡 Supervision Process</h1>
 
-    <!-- FORMULAIRE -->
     <div class="container-box">
         <h3>⚙️ Ajouter une variable</h3>
-
         <form id="formAdd" class="row g-3 mt-1">
             <div class="col-md-3">
                 <input id="name" class="form-control" placeholder="Nom (Temp1)" required>
@@ -51,19 +53,16 @@
         </form>
     </div>
 
-    <!-- LISTE + GRAPHIQUE -->
     <div class="container-box">
         <h3>📋 Variables configurées</h3>
-
         <ul id="varsList" class="list-group mt-3"></ul>
-
         <hr>
-
         <h3>📈 Graphique</h3>
-
         <div class="row mb-3">
             <div class="col-md-6">
-                <select id="selectVar" class="form-select"></select>
+                <select id="selectVar" class="form-select">
+                    <option value="">-- choisir --</option>
+                </select>
             </div>
             <div class="col-md-6 text-end">
                 <div class="btn-group" role="group">
@@ -72,47 +71,64 @@
                 </div>
             </div>
         </div>
-
         <div class="chart-container">
             <canvas id="chart"></canvas>
         </div>
     </div>
-
 </div>
 
 <script>
-const API = "http://localhost:3000/api";
-let chart;
+// Base URL de l'API : même host que la page, port 3000
+const API = `${window.location.protocol}//${window.location.hostname}:3000/api`;
+let chart = null;
 
-/* -------------------
-   CHARGER LES VARIABLES
-------------------- */
 async function loadVariables() {
     try {
         const res = await fetch(`${API}/variables`);
+        if (!res.ok) throw new Error("Réponse non OK");
         const vars = await res.json();
 
         const list = document.getElementById("varsList");
         const sel = document.getElementById("selectVar");
-
         list.innerHTML = "";
         sel.innerHTML = "<option value=''>-- choisir --</option>";
+
+        if (!Array.isArray(vars) || vars.length === 0) {
+            const li = document.createElement("li");
+            li.className = "list-group-item";
+            li.textContent = "Aucune variable configurée pour le moment.";
+            list.appendChild(li);
+            return;
+        }
 
         vars.forEach(v => {
             const li = document.createElement("li");
             li.className = "list-group-item d-flex justify-content-between align-items-center";
+
             li.innerHTML = `
-                <span><strong>${v.name}</strong> — IP: ${v.ip} — Reg: ${v.register_address} — ${v.frequency}s</span>
+                <span>
+                    <strong>${v.name}</strong>
+                    — IP: ${v.ip}
+                    — Reg: ${v.register_address}
+                    — ${v.frequency}s
+                </span>
                 <div>
-                  <button class="btn btn-sm btn-danger me-2">Supprimer</button>
+                    <button class="btn btn-sm btn-danger me-2">Supprimer</button>
                 </div>
             `;
+
             li.querySelector("button").onclick = async () => {
                 if (!confirm("Supprimer cette variable ?")) return;
-                await fetch(`${API}/variables/${v.id}`, { method: "DELETE" });
-                await refreshSchedules();
-                loadVariables();
+                try {
+                    const delRes = await fetch(`${API}/variables/${v.id}`, { method: "DELETE" });
+                    if (!delRes.ok) throw new Error("Erreur suppression");
+                    await loadVariables();
+                } catch (err) {
+                    console.error("Erreur suppression variable :", err);
+                    alert("Erreur lors de la suppression.");
+                }
             };
+
             list.appendChild(li);
 
             const opt = document.createElement("option");
@@ -122,53 +138,46 @@ async function loadVariables() {
         });
     } catch (err) {
         console.error("loadVariables:", err);
-        alert("Impossible de charger les variables (backend unreachable).");
+        alert("Impossible de charger les variables (backend indisponible ?).");
     }
 }
 
-/* -------------------
-   AJOUTER UNE VARIABLE
-------------------- */
 document.getElementById("formAdd").onsubmit = async (e) => {
     e.preventDefault();
-
     const payload = {
         name: document.getElementById("name").value,
         ip: document.getElementById("ip").value,
-        register_address: parseInt(document.getElementById("register").value),
-        frequency: parseInt(document.getElementById("frequency").value)
+        register_address: parseInt(document.getElementById("register").value, 10),
+        frequency: parseInt(document.getElementById("frequency").value, 10)
     };
 
-    await fetch(`${API}/variables`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-    });
+    try {
+        const res = await fetch(`${API}/variables`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
 
-    document.getElementById("formAdd").reset();
-    await refreshSchedules();
-    await loadVariables();
+        if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            const msg = errData.error || "Erreur lors de l'ajout de la variable.";
+            alert(msg);
+            return;
+        }
+
+        document.getElementById("formAdd").reset();
+        await loadVariables();
+    } catch (err) {
+        console.error("Erreur ajout variable:", err);
+        alert("Erreur lors de l'ajout (backend indisponible ?).");
+    }
 };
 
-/* -------------------
-   RAFRAICHIR LES TACHES (backend)
-------------------- */
-async function refreshSchedules() {
-    try {
-        await fetch(`${API}/refresh`, { method: "POST" });
-    } catch (err) {
-        console.error("refreshSchedules:", err);
-    }
-}
-
-/* -------------------
-   AFFICHER LE GRAPHIQUE
-------------------- */
 async function loadChart(id) {
     if (!id) return;
-
     try {
         const res = await fetch(`${API}/history/${id}`);
+        if (!res.ok) throw new Error("Réponse non OK");
         const data = await res.json();
 
         const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
@@ -185,12 +194,17 @@ async function loadChart(id) {
                         borderColor: "#1d4ed8",
                         backgroundColor: "rgba(29,78,216,0.15)",
                         borderWidth: 2,
-                        fill: true
+                        fill: true,
+                        tension: 0.2
                     }]
                 },
                 options: {
                     animation: false,
-                    scales: { x: { ticks: { color: "#444" } }, y: { ticks: { color: "#444" } } }
+                    responsive: true,
+                    scales: {
+                        x: { title: { display: true, text: "Temps" } },
+                        y: { title: { display: true, text: "Valeur" } }
+                    }
                 }
             });
         } else {
@@ -203,14 +217,12 @@ async function loadChart(id) {
     }
 }
 
-/* -------------------
-   EXPORT CSV
-------------------- */
-document.getElementById("btnExport").onclick = async () => {
+document.getElementById("btnExport").onclick = () => {
     const id = document.getElementById("selectVar").value;
-    if (!id) return alert("Choisir une variable pour exporter.");
-
-    // t'affiche une boite pour choisir plage, sinon export tout
+    if (!id) {
+        alert("Choisir une variable pour exporter.");
+        return;
+    }
     const start = prompt("Date de début (YYYY-MM-DD) - laisser vide pour tout");
     const end = prompt("Date de fin (YYYY-MM-DD) - laisser vide pour tout");
 
@@ -218,26 +230,28 @@ document.getElementById("btnExport").onclick = async () => {
     if (start) url += `&start=${encodeURIComponent(start)}`;
     if (end) url += `&end=${encodeURIComponent(end)}`;
 
-    // téléchargement
     window.location = url;
 };
 
-/* -------------------
-   MISE À JOUR AUTO DU GRAPHIQUE
-------------------- */
 setInterval(() => {
     const id = document.getElementById("selectVar").value;
     if (id) loadChart(id);
 }, 2000);
 
-/* -------------------
-   INIT
-------------------- */
 document.getElementById("selectVar").onchange = (e) => loadChart(e.target.value);
-document.getElementById("btnRefresh").onclick = async () => { await refreshSchedules(); alert("Tâches rafraîchies"); };
 
+document.getElementById("btnRefresh").onclick = async () => {
+    try {
+        await fetch(`${API}/refresh`, { method: "POST" });
+        alert("Tâches cron rafraîchies.");
+    } catch (err) {
+        console.error("refreshSchedules:", err);
+        alert("Erreur lors du rafraîchissement des tâches.");
+    }
+};
+
+// Premier chargement
 loadVariables();
 </script>
-
 </body>
 </html>
