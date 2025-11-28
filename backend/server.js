@@ -5,14 +5,12 @@ const mysql = require("mysql2/promise");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const cron = require("node-cron");
+const ModbusRTU = require("modbus-serial");
 
 const app = express();
-
-// --- Middlewares ---
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- Config DB & Serveur ---
 const DB_HOST = process.env.DB_HOST || "mariadb";
 const DB_USER = process.env.DB_USER || "root";
 const DB_PASSWORD = process.env.DB_PASSWORD || "root";
@@ -20,9 +18,9 @@ const DB_NAME = process.env.DB_NAME || "supervision";
 const DB_PORT = parseInt(process.env.DB_PORT, 10) || 3306;
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
-console.log("📦 Config DB :", { DB_HOST, DB_USER, DB_NAME, DB_PORT });
+console.log("DB config:", { DB_HOST, DB_USER, DB_NAME, DB_PORT });
 
-// --- Pool MySQL ---
+// MySQL pool
 const db = mysql.createPool({
   host: DB_HOST,
   user: DB_USER,
@@ -34,226 +32,243 @@ const db = mysql.createPool({
   queueLimit: 0,
 });
 
-// Stockage des tâches cron par id de variable
-let cronJobs = {};
+// Cache des clients Modbus par automate.id
+const modbusClients = {}; // { [automateId]: { client, lastConnect } }
 
-// --- Simulation de lecture (Modbus plus tard) ---
-async function readValueFake() {
-  return Number((Math.random() * 100).toFixed(2));
+function addressFromRaw(raw) {
+  // attendu: "%Q0.6.5" ou "%I0.5.5"
+  // extraction simple
+  const m = raw.match(/^%([QI])\d*\.(\d+)\.(\d+)$/i);
+  if (!m) return null;
+  const type = m[1].toUpperCase();
+  const byte = parseInt(m[2], 10);
+  const bit = parseInt(m[3], 10);
+  const addr = byte * 8 + bit;
+  return { type: type === "Q" ? "OUTPUT" : "INPUT", modbus_address: addr };
 }
 
-// --- (Re)chargement des tâches cron depuis la BDD ---
-async function refreshSchedules() {
-  console.log("🔄 Rechargement des tâches de supervision...");
-
-  // Stop et vide les anciennes tâches
-  try {
-    Object.values(cronJobs).forEach((job) => {
-      try {
-        job.stop();
-      } catch (e) {}
-    });
-  } catch (e) {
-    console.error("Erreur lors de l'arrêt des anciens cron :", e.message);
+async function getModbusClient(automate) {
+  // automate: { id, ip, port }
+  if (!automate) throw new Error("automate requis");
+  const key = automate.id;
+  if (modbusClients[key] && modbusClients[key].client) {
+    // vérifier connectivité simple
+    try {
+      // ping: readCoils 0,1 - cheap
+      return modbusClients[key].client;
+    } catch (e) {
+      // fallthrough reconnect
+    }
   }
+  // create and connect
+  const client = new ModbusRTU();
+  try {
+    await client.connectTCP(automate.ip, { port: automate.port, timeout: 2000 });
+    client.setID(1);
+    modbusClients[key] = { client, lastConnect: Date.now() };
+    console.log(`Modbus connecté à ${automate.ip}:${automate.port} (id=${key})`);
+    return client;
+  } catch (err) {
+    console.error(`Impossible de connecter Modbus ${automate.ip}:${automate.port} -> ${err.message}`);
+    throw err;
+  }
+}
 
+// saver: insert history
+async function saveHistory(variable_id, value) {
+  try {
+    await db.query("INSERT INTO history (variable_id, value) VALUES (?, ?)", [variable_id, value]);
+  } catch (err) {
+    console.error("Erreur saveHistory:", err.message);
+  }
+}
+
+// read a single variable live from automate
+async function readVariableLive(variable) {
+  try {
+    const [automates] = await db.query("SELECT * FROM automates WHERE id = ?", [variable.automate_id]);
+    if (automates.length === 0) throw new Error("Automate introuvable");
+    const automate = automates[0];
+    const client = await getModbusClient(automate);
+    const addr = variable.modbus_address;
+    if (variable.type === "OUTPUT") {
+      // coils
+      const resp = await client.readCoils(addr, 1);
+      return resp.data[0] ? 1 : 0;
+    } else {
+      // INPUT -> discrete inputs
+      const resp = await client.readDiscreteInputs(addr, 1);
+      return resp.data[0] ? 1 : 0;
+    }
+  } catch (err) {
+    console.error(`readVariableLive id=${variable.id} (${variable.address_raw}):`, err.message);
+    throw err;
+  }
+}
+
+// write single coil (for OUTPUT variables)
+async function writeVariable(variable_id, value) {
+  try {
+    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [variable_id]);
+    if (vars.length === 0) throw new Error("Variable introuvable");
+    const v = vars[0];
+    if (v.type !== "OUTPUT") throw new Error("Variable non écrivable (pas une sortie)");
+    const client = await getModbusClient({ id: v.automate_id, ip: v.ip, port: v.port });
+    const addr = v.modbus_address;
+    // write single coil (true/false)
+    await client.writeCoil(addr, !!value);
+    // save to history the written state
+    await saveHistory(variable_id, value ? 1 : 0);
+    return { ok: true };
+  } catch (err) {
+    console.error("Erreur writeVariable:", err.message);
+    throw err;
+  }
+}
+
+// Cron scheduler - load variables and schedule reads
+let cronJobs = {};
+async function refreshSchedules() {
+  try {
+    // stop all jobs
+    Object.values(cronJobs).forEach((j) => { try { j.stop(); } catch (e) {} });
+  } catch (e) {}
   cronJobs = {};
 
   try {
-    const [vars] = await db.query("SELECT * FROM variables");
-    console.log(`📊 ${vars.length} variables trouvées en BDD.`);
-
+    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id");
     vars.forEach((v) => {
       let freq = parseInt(v.frequency, 10);
       if (!Number.isFinite(freq) || freq <= 0) freq = 5;
-
-      // cron en secondes : */freq * * * * *
-      const interval = `*/${freq} * * * * *`;
-
+      const interval = `*/${freq} * * * * *`; // every freq seconds
       try {
         const job = cron.schedule(interval, async () => {
           try {
-            const value = await readValueFake();
-            await db.query(
-              "INSERT INTO history (variable_id, value) VALUES (?, ?)",
-              [v.id, value]
-            );
-          } catch (err) {
-            console.error(
-              `Erreur insertion history pour variable ${v.id}:`,
-              err.message
-            );
+            const liveVal = await readVariableLive(v).catch(() => null);
+            if (liveVal !== null) {
+              await saveHistory(v.id, liveVal);
+            }
+          } catch (e) {
+            console.error("Erreur lecture cron variable:", e.message);
           }
         });
-
         cronJobs[v.id] = job;
-      } catch (err) {
-        console.error(
-          `Erreur création cron pour variable ${v.id}:`,
-          err.message
-        );
+      } catch (e) {
+        console.error("Erreur création cron:", e.message);
       }
     });
-
-    console.log("✔ Tâches actives :", Object.keys(cronJobs).length);
+    console.log("Tâches cron rafraîchies:", Object.keys(cronJobs).length);
   } catch (err) {
-    console.error("Erreur lors du refreshSchedules:", err.message);
+    console.error("Erreur refreshSchedules:", err.message);
   }
 }
 
 // --- Routes ---
-// Healthcheck simple
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", message: "Backend opérationnel" });
+
+app.get("/api/health", (req, res) => res.json({ status: "ok", message: "Backend opérationnel" }));
+
+// Automates
+app.get("/api/automates", async (req, res) => {
+  const [rows] = await db.query("SELECT * FROM automates");
+  res.json(rows);
+});
+app.post("/api/automates", async (req, res) => {
+  const { name, ip, port } = req.body;
+  if (!name || !ip) return res.status(400).json({ error: "name & ip requis" });
+  await db.query("INSERT INTO automates (name, ip, port) VALUES (?, ?, ?)", [name, ip, port || 502]);
+  res.json({ ok: true });
 });
 
-// Liste des variables
+// Variables - list
 app.get("/api/variables", async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT * FROM variables ORDER BY id ASC");
-    res.json(rows);
-  } catch (err) {
-    console.error("GET /api/variables:", err.message);
-    res.status(500).json({ error: "Erreur serveur" });
-  }
+  const [rows] = await db.query("SELECT v.*, a.name as automate_name, a.ip as automate_ip FROM variables v JOIN automates a ON v.automate_id=a.id ORDER BY v.id ASC");
+  res.json(rows);
 });
 
-// Ajout d'une variable
+// Get single variable history
+app.get("/api/history/:id", async (req, res) => {
+  const id = req.params.id;
+  const [rows] = await db.query("SELECT timestamp, value FROM history WHERE variable_id = ? ORDER BY timestamp ASC", [id]);
+  res.json(rows);
+});
+
+// Add variable (client provides address_raw and type; server computes modbus_address)
 app.post("/api/variables", async (req, res) => {
   try {
-    let { name, ip, register_address, frequency } = req.body;
-
-    if (!name || !ip || register_address == null || frequency == null) {
-      return res.status(400).json({ error: "Paramètres manquants" });
-    }
-
-    register_address = parseInt(register_address, 10);
-    frequency = parseInt(frequency, 10);
-
-    if (!Number.isFinite(register_address) || register_address < 0) {
-      return res
-        .status(400)
-        .json({ error: "Adresse de registre invalide (nombre positif)" });
-    }
-    if (!Number.isFinite(frequency) || frequency <= 0) {
-      return res
-        .status(400)
-        .json({ error: "Fréquence invalide (nombre > 0)" });
-    }
-
-    const [result] = await db.query(
-      "INSERT INTO variables (name, ip, register_address, frequency) VALUES (?, ?, ?, ?)",
-      [name.trim(), ip.trim(), register_address, frequency]
-    );
-
-    // Rechargement des tâches après ajout
+    const { automate_id, name, address_raw, type, frequency } = req.body;
+    if (!automate_id || !name || !address_raw || !type) return res.status(400).json({ error: "automate_id,name,address_raw,type requis" });
+    const parsed = addressFromRaw(address_raw);
+    if (!parsed) return res.status(400).json({ error: "address_raw format invalide (ex %Q0.6.5)" });
+    const modbus_address = parsed.modbus_address;
+    await db.query("INSERT INTO variables (automate_id, name, address_raw, type, modbus_address, frequency) VALUES (?, ?, ?, ?, ?, ?)",
+      [automate_id, name.trim(), address_raw.trim(), type === "INPUT" ? "INPUT" : "OUTPUT", modbus_address, frequency || 5]);
     await refreshSchedules();
-
-    res.json({ message: "Variable ajoutée", id: result.insertId });
+    res.json({ ok: true });
   } catch (err) {
     console.error("POST /api/variables:", err.message);
-    res.status(500).json({ error: "Erreur serveur" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Suppression d'une variable
+// Delete variable
 app.delete("/api/variables/:id", async (req, res) => {
+  const id = req.params.id;
+  await db.query("DELETE FROM variables WHERE id = ?", [id]);
+  await refreshSchedules();
+  res.json({ ok: true });
+});
+
+// Read a variable live (one-shot)
+app.get("/api/variables/read/:id", async (req, res) => {
   try {
     const id = req.params.id;
-
-    await db.query("DELETE FROM variables WHERE id = ?", [id]);
-
-    // Arrêt du cron spécifique si encore présent
-    if (cronJobs[id]) {
-      try {
-        cronJobs[id].stop();
-      } catch (e) {}
-      delete cronJobs[id];
-    }
-
-    // Rechargement global pour être sûr d'être synchro avec la BDD
-    await refreshSchedules();
-
-    res.json({ message: "Variable supprimée" });
+    const [rows] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Variable introuvable" });
+    const val = await readVariableLive(rows[0]);
+    res.json({ value: val });
   } catch (err) {
-    console.error("DELETE /api/variables/:id:", err.message);
-    res.status(500).json({ error: "Erreur serveur" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Historique d'une variable
-app.get("/api/history/:id", async (req, res) => {
+// Write a variable (only OUTPUT)
+app.post("/api/variables/write", async (req, res) => {
   try {
-    const id = req.params.id;
-    const [rows] = await db.query(
-      "SELECT timestamp, value FROM history WHERE variable_id = ? ORDER BY timestamp ASC",
-      [id]
-    );
-    res.json(rows);
+    const { id, value } = req.body;
+    if (id == null || value == null) return res.status(400).json({ error: "id & value requis" });
+    await writeVariable(id, value);
+    res.json({ ok: true });
   } catch (err) {
-    console.error("GET /api/history/:id:", err.message);
-    res.status(500).json({ error: "Erreur serveur" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Export CSV
-app.get("/api/export", async (req, res) => {
-  try {
-    const id = req.query.id;
-    const start = req.query.start;
-    const end = req.query.end;
-
-    if (!id) return res.status(400).json({ error: "id requis" });
-
-    let sql = "SELECT timestamp, value FROM history WHERE variable_id = ?";
-    const params = [id];
-
-    if (start) {
-      sql += " AND timestamp >= ?";
-      params.push(start + " 00:00:00");
-    }
-    if (end) {
-      sql += " AND timestamp <= ?";
-      params.push(end + " 23:59:59");
-    }
-    sql += " ORDER BY timestamp ASC";
-
-    const [rows] = await db.query(sql, params);
-
-    let csv = "timestamp,value\r\n";
-    rows.forEach((r) => {
-      const ts =
-        r.timestamp instanceof Date
-          ? r.timestamp.toISOString()
-          : new Date(r.timestamp).toISOString();
-      csv += `${ts},${r.value}\r\n`;
-    });
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=export_variable_${id}.csv`
-    );
-    res.send(csv);
-  } catch (err) {
-    console.error("GET /api/export:", err.message);
-    res.status(500).json({ error: "Erreur serveur" });
-  }
-});
-
-// Rechargement manuel des cron
+// manual refresh
 app.post("/api/refresh", async (req, res) => {
   try {
     await refreshSchedules();
     res.json({ message: "Cron mis à jour" });
   } catch (err) {
-    console.error("POST /api/refresh:", err.message);
-    res.status(500).json({ error: "Erreur" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- Démarrage du serveur ---
-app.listen(PORT, async () => {
-  console.log(`🚀 Backend lancé sur http://localhost:${PORT}`);
-  await refreshSchedules();
-});
+// Start: wait DB ready then run
+const startServer = async () => {
+  let attempts = 0;
+  while (attempts < 10) {
+    try {
+      await db.query("SELECT 1");
+      break;
+    } catch (e) {
+      attempts++;
+      console.log("DB non prête, attente...");
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+  app.listen(PORT, async () => {
+    console.log(`Backend lancé sur 0.0.0.0:${PORT}`);
+    await refreshSchedules();
+  });
+};
+startServer();
