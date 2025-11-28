@@ -4,271 +4,256 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const cron = require("node-cron");
 const ModbusRTU = require("modbus-serial");
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-const DB_HOST = process.env.DB_HOST || "mariadb";
-const DB_USER = process.env.DB_USER || "root";
-const DB_PASSWORD = process.env.DB_PASSWORD || "root";
-const DB_NAME = process.env.DB_NAME || "supervision";
-const DB_PORT = parseInt(process.env.DB_PORT, 10) || 3306;
-const PORT = parseInt(process.env.PORT, 10) || 3000;
-
-console.log("DB config:", { DB_HOST, DB_USER, DB_NAME, DB_PORT });
-
-// MySQL pool
+// DB pool
 const db = mysql.createPool({
-  host: DB_HOST,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
-  port: DB_PORT,
+  host: process.env.DB_HOST || "mariadb",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "root",
+  database: process.env.DB_NAME || "supervision",
+  port: parseInt(process.env.DB_PORT || "3306", 10),
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0,
+  queueLimit: 0
 });
 
-// Cache des clients Modbus par automate.id
-const modbusClients = {}; // { [automateId]: { client, lastConnect } }
+// PLC config (single automate)
+const PLC_IP = process.env.PLC_IP || "172.16.1.24";
+const PLC_PORT = parseInt(process.env.PLC_PORT || "502", 10);
 
-function addressFromRaw(raw) {
-  // attendu: "%Q0.6.5" ou "%I0.5.5"
-  // extraction simple
-  const m = raw.match(/^%([QI])\d*\.(\d+)\.(\d+)$/i);
-  if (!m) return null;
-  const type = m[1].toUpperCase();
-  const byte = parseInt(m[2], 10);
-  const bit = parseInt(m[3], 10);
-  const addr = byte * 8 + bit;
-  return { type: type === "Q" ? "OUTPUT" : "INPUT", modbus_address: addr };
-}
+// global modbus client (reused)
+let modbusClient = null;
+let modbusLastConnect = 0;
 
-async function getModbusClient(automate) {
-  // automate: { id, ip, port }
-  if (!automate) throw new Error("automate requis");
-  const key = automate.id;
-  if (modbusClients[key] && modbusClients[key].client) {
-    // vérifier connectivité simple
-    try {
-      // ping: readCoils 0,1 - cheap
-      return modbusClients[key].client;
-    } catch (e) {
-      // fallthrough reconnect
-    }
+async function getModbusClient() {
+  // if client exists and seems connected, reuse
+  if (modbusClient) {
+    return modbusClient;
   }
-  // create and connect
   const client = new ModbusRTU();
   try {
-    await client.connectTCP(automate.ip, { port: automate.port, timeout: 2000 });
+    await client.connectTCP(PLC_IP, { port: PLC_PORT, timeout: 2000 });
     client.setID(1);
-    modbusClients[key] = { client, lastConnect: Date.now() };
-    console.log(`Modbus connecté à ${automate.ip}:${automate.port} (id=${key})`);
-    return client;
+    modbusClient = client;
+    modbusLastConnect = Date.now();
+    console.log("Modbus connecté à", PLC_IP + ":" + PLC_PORT);
+    return modbusClient;
   } catch (err) {
-    console.error(`Impossible de connecter Modbus ${automate.ip}:${automate.port} -> ${err.message}`);
-    throw err;
+    modbusClient = null;
+    throw new Error("Impossible de se connecter au PLC: " + err.message);
   }
 }
 
-// saver: insert history
-async function saveHistory(variable_id, value) {
-  try {
-    await db.query("INSERT INTO history (variable_id, value) VALUES (?, ?)", [variable_id, value]);
-  } catch (err) {
-    console.error("Erreur saveHistory:", err.message);
+// Parse address formats:
+// digital: %Q0.6.5 or %I0.5.5  -> modbus bit index = byte*8 + bit
+// analog: %IW<number> or %QW<number> -> register index
+function parseAddress(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  raw = raw.trim();
+
+  // digital pattern: %Q0.6.5 or %I0.5.5
+  const d = raw.match(/^%([QI])\d*\.(\d+)\.(\d+)$/i);
+  if (d) {
+    const letter = d[1].toUpperCase();
+    const byte = parseInt(d[2], 10);
+    const bit = parseInt(d[3], 10);
+    const modbus_address = byte * 8 + bit;
+    return {
+      kind: "digital",
+      type: letter === "Q" ? "OUTPUT" : "INPUT",
+      modbus_address
+    };
   }
+
+  // analog simple: %IW100 or %QW50
+  const a = raw.match(/^%(I|Q)W(\d+)$/i);
+  if (a) {
+    const side = a[1].toUpperCase();
+    const idx = parseInt(a[2], 10);
+    return {
+      kind: "analog",
+      type: side === "I" ? "ANALOG_INPUT" : "ANALOG_OUTPUT",
+      modbus_address: idx
+    };
+  }
+
+  // fallback: try to extract trailing number
+  const f = raw.match(/^%([IQ]W?)\d*(?:\.(\d+))?(?:\.(\d+))?$/i);
+  if (f) {
+    const tag = f[1].toUpperCase();
+    const last = f[3] || f[2];
+    const idx = last ? parseInt(last, 10) : 0;
+    if (tag.startsWith("IW")) return { kind: "analog", type: "ANALOG_INPUT", modbus_address: idx };
+    if (tag.startsWith("QW")) return { kind: "analog", type: "ANALOG_OUTPUT", modbus_address: idx };
+  }
+
+  return null;
 }
 
-// read a single variable live from automate
-async function readVariableLive(variable) {
+function applyScaling(raw, vRow) {
+  // if scaling present (manual), use it
+  if (vRow.raw_min != null && vRow.raw_max != null && vRow.scale_min != null && vRow.scale_max != null) {
+    const rawMin = Number(vRow.raw_min);
+    const rawMax = Number(vRow.raw_max);
+    const sMin = Number(vRow.scale_min);
+    const sMax = Number(vRow.scale_max);
+    if (rawMax === rawMin) return sMin;
+    const scaled = sMin + ((raw - rawMin) * (sMax - sMin)) / (rawMax - rawMin);
+    return Number(scaled.toFixed(3));
+  }
+  return raw;
+}
+
+async function readVariableLive(vRow) {
+  // vRow: row from DB (type, modbus_address, etc.)
   try {
-    const [automates] = await db.query("SELECT * FROM automates WHERE id = ?", [variable.automate_id]);
-    if (automates.length === 0) throw new Error("Automate introuvable");
-    const automate = automates[0];
-    const client = await getModbusClient(automate);
-    const addr = variable.modbus_address;
-    if (variable.type === "OUTPUT") {
-      // coils
-      const resp = await client.readCoils(addr, 1);
-      return resp.data[0] ? 1 : 0;
-    } else {
-      // INPUT -> discrete inputs
-      const resp = await client.readDiscreteInputs(addr, 1);
-      return resp.data[0] ? 1 : 0;
+    const client = await getModbusClient();
+
+    if (vRow.type === "INPUT") {
+      const resp = await client.readDiscreteInputs(vRow.modbus_address, 1);
+      const bit = resp.data[0] ? 1 : 0;
+      return { raw: bit, value: bit, kind: "digital" };
     }
+
+    if (vRow.type === "OUTPUT") {
+      const resp = await client.readCoils(vRow.modbus_address, 1);
+      const bit = resp.data[0] ? 1 : 0;
+      return { raw: bit, value: bit, kind: "digital" };
+    }
+
+    if (vRow.type === "ANALOG_INPUT") {
+      const resp = await client.readInputRegisters(vRow.modbus_address, 1);
+      const raw = resp.data[0];
+      const value = applyScaling(raw, vRow);
+      return { raw, value, kind: "analog" };
+    }
+
+    if (vRow.type === "ANALOG_OUTPUT") {
+      const resp = await client.readHoldingRegisters(vRow.modbus_address, 1);
+      const raw = resp.data[0];
+      const value = applyScaling(raw, vRow);
+      return { raw, value, kind: "analog" };
+    }
+
+    return { raw: null, value: null, kind: "unknown" };
   } catch (err) {
-    console.error(`readVariableLive id=${variable.id} (${variable.address_raw}):`, err.message);
-    throw err;
+    // On any error (e.g. PLC offline) return nulls and include message for debugging
+    return { raw: null, value: null, kind: "error", error: err.message };
   }
 }
 
-// write single coil (for OUTPUT variables)
-async function writeVariable(variable_id, value) {
-  try {
-    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [variable_id]);
-    if (vars.length === 0) throw new Error("Variable introuvable");
-    const v = vars[0];
-    if (v.type !== "OUTPUT") throw new Error("Variable non écrivable (pas une sortie)");
-    const client = await getModbusClient({ id: v.automate_id, ip: v.ip, port: v.port });
-    const addr = v.modbus_address;
-    // write single coil (true/false)
-    await client.writeCoil(addr, !!value);
-    // save to history the written state
-    await saveHistory(variable_id, value ? 1 : 0);
-    return { ok: true };
-  } catch (err) {
-    console.error("Erreur writeVariable:", err.message);
-    throw err;
-  }
-}
+// --- API routes ---
 
-// Cron scheduler - load variables and schedule reads
-let cronJobs = {};
-async function refreshSchedules() {
-  try {
-    // stop all jobs
-    Object.values(cronJobs).forEach((j) => { try { j.stop(); } catch (e) {} });
-  } catch (e) {}
-  cronJobs = {};
-
-  try {
-    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id");
-    vars.forEach((v) => {
-      let freq = parseInt(v.frequency, 10);
-      if (!Number.isFinite(freq) || freq <= 0) freq = 5;
-      const interval = `*/${freq} * * * * *`; // every freq seconds
-      try {
-        const job = cron.schedule(interval, async () => {
-          try {
-            const liveVal = await readVariableLive(v).catch(() => null);
-            if (liveVal !== null) {
-              await saveHistory(v.id, liveVal);
-            }
-          } catch (e) {
-            console.error("Erreur lecture cron variable:", e.message);
-          }
-        });
-        cronJobs[v.id] = job;
-      } catch (e) {
-        console.error("Erreur création cron:", e.message);
-      }
-    });
-    console.log("Tâches cron rafraîchies:", Object.keys(cronJobs).length);
-  } catch (err) {
-    console.error("Erreur refreshSchedules:", err.message);
-  }
-}
-
-// --- Routes ---
-
+// health
 app.get("/api/health", (req, res) => res.json({ status: "ok", message: "Backend opérationnel" }));
 
-// Automates
-app.get("/api/automates", async (req, res) => {
-  const [rows] = await db.query("SELECT * FROM automates");
-  res.json(rows);
-});
-app.post("/api/automates", async (req, res) => {
-  const { name, ip, port } = req.body;
-  if (!name || !ip) return res.status(400).json({ error: "name & ip requis" });
-  await db.query("INSERT INTO automates (name, ip, port) VALUES (?, ?, ?)", [name, ip, port || 502]);
-  res.json({ ok: true });
-});
-
-// Variables - list
+// list variables metadata
 app.get("/api/variables", async (req, res) => {
-  const [rows] = await db.query("SELECT v.*, a.name as automate_name, a.ip as automate_ip FROM variables v JOIN automates a ON v.automate_id=a.id ORDER BY v.id ASC");
-  res.json(rows);
-});
-
-// Get single variable history
-app.get("/api/history/:id", async (req, res) => {
-  const id = req.params.id;
-  const [rows] = await db.query("SELECT timestamp, value FROM history WHERE variable_id = ? ORDER BY timestamp ASC", [id]);
-  res.json(rows);
-});
-
-// Add variable (client provides address_raw and type; server computes modbus_address)
-app.post("/api/variables", async (req, res) => {
   try {
-    const { automate_id, name, address_raw, type, frequency } = req.body;
-    if (!automate_id || !name || !address_raw || !type) return res.status(400).json({ error: "automate_id,name,address_raw,type requis" });
-    const parsed = addressFromRaw(address_raw);
-    if (!parsed) return res.status(400).json({ error: "address_raw format invalide (ex %Q0.6.5)" });
-    const modbus_address = parsed.modbus_address;
-    await db.query("INSERT INTO variables (automate_id, name, address_raw, type, modbus_address, frequency) VALUES (?, ?, ?, ?, ?, ?)",
-      [automate_id, name.trim(), address_raw.trim(), type === "INPUT" ? "INPUT" : "OUTPUT", modbus_address, frequency || 5]);
-    await refreshSchedules();
-    res.json({ ok: true });
+    const [rows] = await db.query("SELECT * FROM variables ORDER BY id ASC");
+    res.json(rows);
   } catch (err) {
-    console.error("POST /api/variables:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Delete variable
-app.delete("/api/variables/:id", async (req, res) => {
-  const id = req.params.id;
-  await db.query("DELETE FROM variables WHERE id = ?", [id]);
-  await refreshSchedules();
-  res.json({ ok: true });
+// add variable
+app.post("/api/variables", async (req, res) => {
+  try {
+    const { name, comment, address_raw, frequency, unit, raw_min, raw_max, scale_min, scale_max } = req.body;
+    if (!name || !address_raw) return res.status(400).json({ error: "name & address_raw requis" });
+
+    const parsed = parseAddress(address_raw);
+    if (!parsed) return res.status(400).json({ error: "address_raw format invalide" });
+
+    const dbType = parsed.type;
+    const modbusAddr = parsed.modbus_address;
+
+    await db.query(
+      `INSERT INTO variables 
+      (name, comment, address_raw, type, modbus_address, frequency, unit, raw_min, raw_max, scale_min, scale_max)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, comment || null, address_raw, dbType, modbusAddr, frequency || 1, unit || null, raw_min || null, raw_max || null, scale_min || null, scale_max || null]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Read a variable live (one-shot)
+// remove variable
+app.delete("/api/variables/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    await db.query("DELETE FROM variables WHERE id = ?", [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// read all values (live). This reads variables in DB and queries PLC.
+app.get("/api/values", async (req, res) => {
+  try {
+    const [vars] = await db.query("SELECT * FROM variables ORDER BY id ASC");
+    const promises = vars.map(async (v) => {
+      const read = await readVariableLive(v);
+      return {
+        id: v.id,
+        name: v.name,
+        comment: v.comment,
+        address_raw: v.address_raw,
+        type: v.type,
+        unit: v.unit,
+        raw: read.raw,
+        value: read.value,
+        kind: read.kind,
+        error: read.error || null
+      };
+    });
+    const results = await Promise.all(promises);
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// read single variable by id (manual read)
 app.get("/api/variables/read/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const [rows] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [id]);
+    const [rows] = await db.query("SELECT * FROM variables WHERE id = ?", [id]);
     if (rows.length === 0) return res.status(404).json({ error: "Variable introuvable" });
-    const val = await readVariableLive(rows[0]);
-    res.json({ value: val });
+    const v = rows[0];
+    const r = await readVariableLive(v);
+    res.json({ id: v.id, raw: r.raw, value: r.value, kind: r.kind, error: r.error || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Write a variable (only OUTPUT)
-app.post("/api/variables/write", async (req, res) => {
-  try {
-    const { id, value } = req.body;
-    if (id == null || value == null) return res.status(400).json({ error: "id & value requis" });
-    await writeVariable(id, value);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// manual refresh
-app.post("/api/refresh", async (req, res) => {
-  try {
-    await refreshSchedules();
-    res.json({ message: "Cron mis à jour" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Start: wait DB ready then run
-const startServer = async () => {
+// Start server after ensuring DB connectivity
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const start = async () => {
   let attempts = 0;
-  while (attempts < 10) {
+  while (attempts < 12) {
     try {
       await db.query("SELECT 1");
       break;
     } catch (e) {
       attempts++;
-      console.log("DB non prête, attente...");
-      await new Promise(r => setTimeout(r, 3000));
+      console.log("Waiting for DB...", attempts);
+      await new Promise((r) => setTimeout(r, 2000));
     }
   }
-  app.listen(PORT, async () => {
-    console.log(`Backend lancé sur 0.0.0.0:${PORT}`);
-    await refreshSchedules();
+  app.listen(PORT, () => {
+    console.log(`Backend listening on 0.0.0.0:${PORT}`);
   });
 };
-startServer();
+start();
