@@ -1,259 +1,168 @@
-// backend/server.js
 require("dotenv").config();
 const express = require("express");
-const mysql = require("mysql2/promise");
 const cors = require("cors");
-const bodyParser = require("body-parser");
+const path = require("path");
 const ModbusRTU = require("modbus-serial");
+const mysql = require("mysql2/promise");
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// DB pool
+// ------------------ CONFIG PLC ------------------
+const PLC_IP = process.env.PLC_IP || "172.16.1.24";
+const PLC_PORT = parseInt(process.env.PLC_PORT || "502");
+const MODBUS_ID = parseInt(process.env.MODBUS_ID || "1");
+
+const networkErrors = ["ESOCKETTIMEDOUT", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH"];
+
+// ------------------ DATABASE ------------------
 const db = mysql.createPool({
-  host: process.env.DB_HOST || "mariadb",
+  host: process.env.DB_HOST || "localhost",
   user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "root",
+  password: process.env.DB_PASSWORD || "rootpassword",
   database: process.env.DB_NAME || "supervision",
-  port: parseInt(process.env.DB_PORT || "3306", 10),
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  port: parseInt(process.env.DB_PORT || "3306")
 });
 
-// PLC config (single automate)
-const PLC_IP = process.env.PLC_IP || "172.16.1.24";
-const PLC_PORT = parseInt(process.env.PLC_PORT || "502", 10);
+// ------------------ MODBUS CLIENT ------------------
+const client = new ModbusRTU();
+let connected = false;
 
-// global modbus client (reused)
-let modbusClient = null;
-let modbusLastConnect = 0;
-
-async function getModbusClient() {
-  // if client exists and seems connected, reuse
-  if (modbusClient) {
-    return modbusClient;
-  }
-  const client = new ModbusRTU();
+async function connectModbus() {
   try {
-    await client.connectTCP(PLC_IP, { port: PLC_PORT, timeout: 2000 });
-    client.setID(1);
-    modbusClient = client;
-    modbusLastConnect = Date.now();
-    console.log("Modbus connecté à", PLC_IP + ":" + PLC_PORT);
-    return modbusClient;
-  } catch (err) {
-    modbusClient = null;
-    throw new Error("Impossible de se connecter au PLC: " + err.message);
+    await client.connectTCP(PLC_IP, { port: PLC_PORT });
+    client.setID(MODBUS_ID);
+    client.setTimeout(2000);
+    connected = true;
+    console.log(`✔ Modbus connecté à ${PLC_IP}:${PLC_PORT}`);
+  } catch (e) {
+    connected = false;
+    console.error("❌ Erreur Modbus:", e.message);
+    if (e.errno && networkErrors.includes(e.errno)) {
+      console.log("Reconnexion dans 5s...");
+      setTimeout(connectModbus, 5000);
+    }
   }
 }
 
-// Parse address formats:
-// digital: %Q0.6.5 or %I0.5.5  -> modbus bit index = byte*8 + bit
-// analog: %IW<number> or %QW<number> -> register index
+client.on("error", (err) => {
+  console.error("Modbus client error:", err.message);
+  connected = false;
+  setTimeout(connectModbus, 5000);
+});
+
+connectModbus();
+
+// ------------------ PARSEUR ADRESSES SCHNEIDER ------------------
 function parseAddress(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  raw = raw.trim();
+  raw = raw.trim().toUpperCase();
 
-  // digital pattern: %Q0.6.5 or %I0.5.5
-  const d = raw.match(/^%([QI])\d*\.(\d+)\.(\d+)$/i);
-  if (d) {
-    const letter = d[1].toUpperCase();
-    const byte = parseInt(d[2], 10);
-    const bit = parseInt(d[3], 10);
-    const modbus_address = byte * 8 + bit;
-    return {
-      kind: "digital",
-      type: letter === "Q" ? "OUTPUT" : "INPUT",
-      modbus_address
-    };
+  let m = raw.match(/^%([IQ])(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const X = parseInt(m[2], 10);
+    const Y = parseInt(m[3], 10);
+    const Z = parseInt(m[4], 10);
+    return { kind: "digital", type: m[1] === "I" ? "INPUT" : "OUTPUT", modbus_address: X * 64 + Y * 8 + Z };
   }
 
-  // analog simple: %IW100 or %QW50
-  const a = raw.match(/^%(I|Q)W(\d+)$/i);
-  if (a) {
-    const side = a[1].toUpperCase();
-    const idx = parseInt(a[2], 10);
-    return {
-      kind: "analog",
-      type: side === "I" ? "ANALOG_INPUT" : "ANALOG_OUTPUT",
-      modbus_address: idx
-    };
-  }
-
-  // fallback: try to extract trailing number
-  const f = raw.match(/^%([IQ]W?)\d*(?:\.(\d+))?(?:\.(\d+))?$/i);
-  if (f) {
-    const tag = f[1].toUpperCase();
-    const last = f[3] || f[2];
-    const idx = last ? parseInt(last, 10) : 0;
-    if (tag.startsWith("IW")) return { kind: "analog", type: "ANALOG_INPUT", modbus_address: idx };
-    if (tag.startsWith("QW")) return { kind: "analog", type: "ANALOG_OUTPUT", modbus_address: idx };
-  }
+  m = raw.match(/^%([IQ])W(\d+)$/);
+  if (m) return { kind: "analog", type: m[1] === "I" ? "ANALOG_INPUT" : "ANALOG_OUTPUT", modbus_address: parseInt(m[2], 10) };
 
   return null;
 }
 
-function applyScaling(raw, vRow) {
-  // if scaling present (manual), use it
-  if (vRow.raw_min != null && vRow.raw_max != null && vRow.scale_min != null && vRow.scale_max != null) {
-    const rawMin = Number(vRow.raw_min);
-    const rawMax = Number(vRow.raw_max);
-    const sMin = Number(vRow.scale_min);
-    const sMax = Number(vRow.scale_max);
-    if (rawMax === rawMin) return sMin;
-    const scaled = sMin + ((raw - rawMin) * (sMax - sMin)) / (rawMax - rawMin);
-    return Number(scaled.toFixed(3));
-  }
-  return raw;
-}
-
-async function readVariableLive(vRow) {
-  // vRow: row from DB (type, modbus_address, etc.)
+// ------------------ LECTURE VARIABLE ------------------
+async function readVariable(v) {
+  if (!connected) return { raw: null, value: null, kind: "error", error: "Modbus non connecté" };
   try {
-    const client = await getModbusClient();
-
-    if (vRow.type === "INPUT") {
-      const resp = await client.readDiscreteInputs(vRow.modbus_address, 1);
-      const bit = resp.data[0] ? 1 : 0;
-      return { raw: bit, value: bit, kind: "digital" };
+    if (v.kind === "digital" && v.type === "INPUT") {
+      const r = await client.readDiscreteInputs(v.modbus_address, 1);
+      console.log(`Lecture digital INPUT coil ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0] ? 1 : 0, kind: "digital" };
     }
-
-    if (vRow.type === "OUTPUT") {
-      const resp = await client.readCoils(vRow.modbus_address, 1);
-      const bit = resp.data[0] ? 1 : 0;
-      return { raw: bit, value: bit, kind: "digital" };
+    if (v.kind === "digital" && v.type === "OUTPUT") {
+      const r = await client.readCoils(v.modbus_address, 1);
+      console.log(`Lecture digital OUTPUT coil ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0] ? 1 : 0, kind: "digital" };
     }
-
-    if (vRow.type === "ANALOG_INPUT") {
-      const resp = await client.readInputRegisters(vRow.modbus_address, 1);
-      const raw = resp.data[0];
-      const value = applyScaling(raw, vRow);
-      return { raw, value, kind: "analog" };
+    if (v.kind === "analog" && v.type === "ANALOG_INPUT") {
+      const r = await client.readInputRegisters(v.modbus_address, 1);
+      console.log(`Lecture analog INPUT reg ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0], kind: "analog" };
     }
-
-    if (vRow.type === "ANALOG_OUTPUT") {
-      const resp = await client.readHoldingRegisters(vRow.modbus_address, 1);
-      const raw = resp.data[0];
-      const value = applyScaling(raw, vRow);
-      return { raw, value, kind: "analog" };
+    if (v.kind === "analog" && v.type === "ANALOG_OUTPUT") {
+      const r = await client.readHoldingRegisters(v.modbus_address, 1);
+      console.log(`Lecture analog OUTPUT reg ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0], kind: "analog" };
     }
-
     return { raw: null, value: null, kind: "unknown" };
   } catch (err) {
-    // On any error (e.g. PLC offline) return nulls and include message for debugging
+    console.error("Erreur lecture Modbus:", err.message);
     return { raw: null, value: null, kind: "error", error: err.message };
   }
 }
 
-// --- API routes ---
+// ------------------ FRONTEND ------------------
+app.use(express.static(path.join(__dirname, "./frontend")));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "./frontend/index.html")));
 
-// health
-app.get("/api/health", (req, res) => res.json({ status: "ok", message: "Backend opérationnel" }));
-
-// list variables metadata
-app.get("/api/variables", async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT * FROM variables ORDER BY id ASC");
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ------------------ ROUTES API ------------------
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", message: connected ? "Modbus connecté" : "Modbus non connecté" });
 });
 
-// add variable
-app.post("/api/variables", async (req, res) => {
-  try {
-    const { name, comment, address_raw, frequency, unit, raw_min, raw_max, scale_min, scale_max } = req.body;
-    if (!name || !address_raw) return res.status(400).json({ error: "name & address_raw requis" });
-
-    const parsed = parseAddress(address_raw);
-    if (!parsed) return res.status(400).json({ error: "address_raw format invalide" });
-
-    const dbType = parsed.type;
-    const modbusAddr = parsed.modbus_address;
-
-    await db.query(
-      `INSERT INTO variables 
-      (name, comment, address_raw, type, modbus_address, frequency, unit, raw_min, raw_max, scale_min, scale_max)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, comment || null, address_raw, dbType, modbusAddr, frequency || 1, unit || null, raw_min || null, raw_max || null, scale_min || null, scale_max || null]
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// remove variable
-app.delete("/api/variables/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    await db.query("DELETE FROM variables WHERE id = ?", [id]);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// read all values (live). This reads variables in DB and queries PLC.
 app.get("/api/values", async (req, res) => {
+  const [vars] = await db.query("SELECT * FROM variables ORDER BY id ASC");
+  const out = await Promise.all(vars.map(async v => ({ ...v, ...await readVariable(parseAddress(v.address_raw)) })));
+  res.json(out);
+});
+
+app.post("/api/variables", async (req, res) => {
+  const { name, comment, address_raw } = req.body;
+  const parsed = parseAddress(address_raw);
+  if (!parsed) return res.status(400).json({ error: "Adresse Schneider invalide" });
+
+  await db.query(
+    "INSERT INTO variables (name, comment, address_raw, type, modbus_address) VALUES (?,?,?,?,?)",
+    [name, comment || null, address_raw, parsed.type, parsed.modbus_address]
+  );
+  res.json({ ok: true });
+});
+
+app.delete("/api/variables/:id", async (req, res) => {
+  await db.query("DELETE FROM variables WHERE id = ?", [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.post("/api/variables/:id/write", async (req, res) => {
+  const { id } = req.params;
+  const { value } = req.body;
+  const [rows] = await db.query("SELECT * FROM variables WHERE id = ?", [id]);
+  if (!rows.length) return res.status(404).json({ error: "Variable non trouvée" });
+
+  const variable = rows[0];
+  const v = parseAddress(variable.address_raw);
+  if (!v) return res.status(400).json({ error: "Adresse Schneider invalide" });
+
+  if (!connected) return res.status(500).json({ error: "Modbus non connecté" });
+
   try {
-    const [vars] = await db.query("SELECT * FROM variables ORDER BY id ASC");
-    const promises = vars.map(async (v) => {
-      const read = await readVariableLive(v);
-      return {
-        id: v.id,
-        name: v.name,
-        comment: v.comment,
-        address_raw: v.address_raw,
-        type: v.type,
-        unit: v.unit,
-        raw: read.raw,
-        value: read.value,
-        kind: read.kind,
-        error: read.error || null
-      };
-    });
-    const results = await Promise.all(promises);
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (v.kind === "digital" && v.type === "OUTPUT") {
+      await client.writeCoil(v.modbus_address, value ? true : false);
+      console.log(`Écriture coil ${v.modbus_address}:`, value);
+    } else if (v.kind === "analog" && v.type === "ANALOG_OUTPUT") {
+      await client.writeRegister(v.modbus_address, Number(value));
+      console.log(`Écriture reg ${v.modbus_address}:`, value);
+    } else return res.status(400).json({ error: "Impossible d’écrire sur cette variable" });
+
+    res.json({ ok: true });
+  } catch (err) { 
+    console.error("Erreur écriture Modbus:", err.message);
+    res.status(500).json({ error: err.message }); 
   }
 });
 
-// read single variable by id (manual read)
-app.get("/api/variables/read/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const [rows] = await db.query("SELECT * FROM variables WHERE id = ?", [id]);
-    if (rows.length === 0) return res.status(404).json({ error: "Variable introuvable" });
-    const v = rows[0];
-    const r = await readVariableLive(v);
-    res.json({ id: v.id, raw: r.raw, value: r.value, kind: r.kind, error: r.error || null });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Start server after ensuring DB connectivity
-const PORT = parseInt(process.env.PORT || "3000", 10);
-const start = async () => {
-  let attempts = 0;
-  while (attempts < 12) {
-    try {
-      await db.query("SELECT 1");
-      break;
-    } catch (e) {
-      attempts++;
-      console.log("Waiting for DB...", attempts);
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-  }
-  app.listen(PORT, () => {
-    console.log(`Backend listening on 0.0.0.0:${PORT}`);
-  });
-};
-start();
+// ------------------ SERVEUR ------------------
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`✔ Backend prêt sur port ${port}`));
