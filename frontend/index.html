@@ -1,307 +1,106 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <title>Supervision Process - Multi Automates</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    body { background: #f5f7fa; font-family: Arial, sans-serif; color: #222; }
-    .container-box { background:white; padding:20px; border-radius:10px; margin-top:20px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
-    .list-group-item { background: #f0f4ff; border: 1px solid #d8e3ff; }
-  </style>
+<meta charset="UTF-8">
+<title>Supervision Automate</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+body{background:#eef2f7;padding:20px;}
+.box{background:white;padding:20px;border-radius:8px;}
+td,th{text-align:center;vertical-align:middle;}
+.small-muted{font-size:0.85rem;color:#666;}
+</style>
 </head>
-<body class="p-4">
+<body>
 <div class="container">
-  <h1 class="text-center mb-4">📡 Supervision Process</h1>
+  <h2 class="mb-4 text-center">📡 Supervision Automate — Variables (live)</h2>
 
-  <div class="container-box">
-    <h3>🖧 Automates</h3>
-    <select id="selectAutomate" class="form-select mb-2"></select>
-    <small class="text-muted">Sélectionne l'automate à consulter.</small>
-  </div>
-
-  <div class="container-box">
-    <h3>⚙️ Ajouter une variable</h3>
-    <form id="formAdd" class="row g-3 mt-1">
-      <div class="col-md-3">
-        <input id="name" class="form-control" placeholder="Nom (Temp1)" required>
-      </div>
-      <div class="col-md-3">
-        <input id="address_raw" class="form-control" placeholder="Adresse raw (%Q0.6.5)" required>
-      </div>
-      <div class="col-md-2">
-        <select id="type" class="form-select">
-          <option value="OUTPUT">%Q (SORTIE)</option>
-          <option value="INPUT">%I (ENTRÉE)</option>
-        </select>
-      </div>
-      <div class="col-md-2">
-        <input id="frequency" type="number" class="form-control" placeholder="Fréquence (s)" required>
-      </div>
-      <div class="col-md-2">
-        <button class="btn btn-primary w-100">Ajouter</button>
-      </div>
+  <div class="box mb-4">
+    <h5>➕ Ajouter une variable</h5>
+    <form id="addForm" class="row g-2 mt-2">
+      <div class="col-md-3"><input id="name" class="form-control" placeholder="Nom" required></div>
+      <div class="col-md-4"><input id="comment" class="form-control" placeholder="Commentaire (optionnel)"></div>
+      <div class="col-md-3"><input id="address_raw" class="form-control" placeholder="%I0.5.5 / %Q0.6.7 / %IW100" required></div>
+      <div class="col-md-2"><button class="btn btn-primary w-100">Ajouter</button></div>
+      <div class="col-12 mt-1"><small class="small-muted">Formats : %I0.5.5, %Q0.6.7, %IW100, %QW20</small></div>
     </form>
   </div>
 
-  <div class="container-box">
-    <h3>📋 Variables configurées</h3>
-    <ul id="varsList" class="list-group mt-3"></ul>
-    <hr>
-    <h3>📈 Graphique</h3>
-    <div class="row mb-3">
-      <div class="col-md-4">
-        <select id="selectVar" class="form-select">
-          <option value="">-- choisir --</option>
-        </select>
-      </div>
-      <div class="col-md-8 text-end">
-        <div class="btn-group" role="group">
-          <button id="btnExport" class="btn btn-outline-secondary">Exporter CSV</button>
-          <button id="btnRefresh" class="btn btn-outline-primary">Rafraîchir tâches</button>
-        </div>
-      </div>
+  <div class="box">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h5 class="mb-0">📋 Variables en temps réel</h5>
+      <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">Rafraîchir</button>
     </div>
-    <div class="chart-container">
-      <canvas id="chart"></canvas>
-    </div>
-    <hr>
-    <h3>🔧 Lecture / Écriture manuelle</h3>
-    <div class="row g-2">
-      <div class="col-md-3">
-        <input id="manual_raw" placeholder="%Q0.6.5" class="form-control">
-      </div>
-      <div class="col-md-2">
-        <button id="btnManualRead" class="btn btn-outline-success w-100">Lire</button>
-      </div>
-      <div class="col-md-2">
-        <input id="manualWriteVal" type="number" placeholder="0 ou 1" class="form-control">
-      </div>
-      <div class="col-md-2">
-        <button id="btnManualWrite" class="btn btn-outline-warning w-100">Ecrire</button>
-      </div>
-      <div class="col-md-3">
-        <div id="manualResult" class="p-2 bg-light border rounded"></div>
-      </div>
-    </div>
+
+    <table class="table table-striped">
+      <thead class="table-primary">
+        <tr><th>Nom</th><th>Commentaire</th><th>Adresse</th><th>Type</th><th>Raw</th><th>Valeur</th><th>Action</th></tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
   </div>
 </div>
 
 <script>
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:3000/api`;
-let automates = [];
-let variables = [];
-let chart = null;
+const API = `http://${window.location.hostname}:3000/api`;
 
-async function loadAutomates() {
-  const res = await fetch(`${API_BASE}/automates`);
-  automates = await res.json();
-  const sel = document.getElementById("selectAutomate");
-  sel.innerHTML = "";
-  automates.forEach(a => {
-    const opt = document.createElement("option");
-    opt.value = a.id;
-    opt.textContent = `${a.name} (${a.ip})`;
-    sel.appendChild(opt);
-  });
-  if (!sel.value && automates.length) sel.value = automates[0].id;
-  await loadVariables();
+async function fetchValues() {
+  try { 
+    const res = await fetch(`${API}/values`); 
+    return await res.json(); 
+  } catch { return []; }
 }
 
-async function loadVariables() {
-  const res = await fetch(`${API_BASE}/variables`);
-  variables = await res.json();
-  const list = document.getElementById("varsList");
-  const sel = document.getElementById("selectVar");
-  list.innerHTML = "";
-  sel.innerHTML = "<option value=''>-- choisir --</option>";
+function escapeHtml(s) {
+  return s ? String(s).replace(/[&<>"'\/=]/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;', '/':'&#x2F;', '=':'&#x3D;'
+  }[c])) : "";
+}
 
-  if (!Array.isArray(variables) || variables.length === 0) {
-    const li = document.createElement("li");
-    li.className = "list-group-item";
-    li.textContent = "Aucune variable configurée pour le moment.";
-    list.appendChild(li);
-    return;
-  }
-
-  variables.forEach(v => {
-    // only show for selected automate
-    const selectedAutomate = document.getElementById("selectAutomate").value;
-    if (selectedAutomate && parseInt(v.automate_id,10) !== parseInt(selectedAutomate,10)) return;
-
-    const li = document.createElement("li");
-    li.className = "list-group-item d-flex justify-content-between align-items-center";
-    li.innerHTML = `
-      <div>
-        <strong>${v.name}</strong> — ${v.address_raw} — ${v.type} — ${v.frequency}s
-        <br><small class="text-muted">Automate: ${v.automate_name} (${v.automate_ip})</small>
-      </div>
-      <div>
-        <button class="btn btn-sm btn-secondary me-2" data-id="${v.id}" onclick="manualRead(${v.id})">Lire</button>
-        ${v.type === 'OUTPUT' ? `<button class="btn btn-sm btn-warning me-2" onclick="manualWrite(${v.id},1)">ON</button><button class="btn btn-sm btn-outline-warning me-2" onclick="manualWrite(${v.id},0)">OFF</button>` : ''}
-        <button class="btn btn-sm btn-danger" onclick="deleteVar(${v.id})">Supprimer</button>
-      </div>
-    `;
-    list.appendChild(li);
-
-    const opt = document.createElement("option");
-    opt.value = v.id;
-    opt.textContent = `${v.name} (${v.address_raw})`;
-    sel.appendChild(opt);
+function renderTable(rows) {
+  const body = document.getElementById("tableBody"); 
+  body.innerHTML = "";
+  rows.forEach(r => {
+    const tr = document.createElement("tr");
+    const raw = (r.raw == null) ? "-" : r.raw;
+    const value = (r.value == null) ? "-" : r.value;
+    let displayValue = value;
+    if (r.kind === "digital") displayValue = (r.value === 1 ? "ON" : r.value === 0 ? "OFF" : "-");
+    const errorHtml = r.error ? `<br><small class="text-danger">${escapeHtml(r.error)}</small>` : "";
+    tr.innerHTML = `<td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.comment||"")}</td><td>${escapeHtml(r.address_raw)}</td><td>${escapeHtml(r.type)}</td><td>${raw}</td><td>${displayValue}${r.unit?" "+escapeHtml(r.unit):""}${errorHtml}</td><td><button class="btn btn-sm btn-danger" onclick="deleteVar(${r.id})">Suppr</button></td>`;
+    body.appendChild(tr);
   });
 }
 
-async function manualRead(varId) {
-  try {
-    const res = await fetch(`${API_BASE}/variables/read/${varId}`);
-    const j = await res.json();
-    alert(`Valeur: ${j.value}`);
-  } catch (err) {
-    alert("Erreur lecture: " + err.message);
-  }
-}
+async function refresh() { renderTable(await fetchValues()); }
 
-async function manualWrite(varId, val) {
-  try {
-    const res = await fetch(`${API_BASE}/variables/write`, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ id: varId, value: val })
-    });
-    const j = await res.json();
-    if (j.ok) alert("Ecriture réussie");
-    else alert("Erreur: " + JSON.stringify(j));
-    await loadVariables();
-  } catch (err) {
-    alert("Erreur écriture: " + err.message);
-  }
-}
-
-async function deleteVar(id) {
-  if (!confirm("Supprimer ?")) return;
-  await fetch(`${API_BASE}/variables/${id}`, { method: "DELETE" });
-  await loadVariables();
-}
-
-document.getElementById("formAdd").onsubmit = async (e) => {
+document.getElementById("addForm").onsubmit = async e => {
   e.preventDefault();
   const payload = {
-    automate_id: document.getElementById("selectAutomate").value,
-    name: document.getElementById("name").value,
-    address_raw: document.getElementById("address_raw").value,
-    type: document.getElementById("type").value,
-    frequency: parseInt(document.getElementById("frequency").value, 10) || 5
+    name: document.getElementById("name").value.trim(),
+    comment: document.getElementById("comment").value.trim(),
+    address_raw: document.getElementById("address_raw").value.trim()
   };
-  const res = await fetch(`${API_BASE}/variables`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  const res = await fetch(`${API}/variables`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
   if (!res.ok) {
     const err = await res.json().catch(()=>({}));
     alert(err.error || "Erreur ajout");
     return;
   }
   e.target.reset();
-  await loadVariables();
+  await refresh();
 };
 
-document.getElementById("btnManualRead").onclick = async () => {
-  const raw = document.getElementById("manual_raw").value.trim();
-  const selAuto = document.getElementById("selectAutomate").value;
-  if (!raw || !selAuto) { alert("Automate et adresse requis"); return; }
-  try {
-    // create temporary variable on backend (one-shot) by posting then reading -- simplified approach:
-    // call the server-side read endpoint that accepts raw address via query
-    const res = await fetch(`${API_BASE}/variables`);
-    const vars = await res.json();
-    // try find an existing variable with same raw and automate
-    const found = vars.find(v => v.address_raw === raw && String(v.automate_id) === String(selAuto));
-    if (found) {
-      const r = await fetch(`${API_BASE}/variables/read/${found.id}`);
-      const j = await r.json();
-      document.getElementById("manualResult").textContent = `Valeur: ${j.value}`;
-      return;
-    } else {
-      alert("Cette adresse n'est pas enregistrée. Ajoute-la d'abord via le formulaire pour la lire.");
-    }
-  } catch (err) {
-    alert("Erreur: " + err.message);
-  }
-};
-
-document.getElementById("btnManualWrite").onclick = async () => {
-  const raw = document.getElementById("manual_raw").value.trim();
-  const val = parseInt(document.getElementById("manualWriteVal").value,10);
-  const selAuto = document.getElementById("selectAutomate").value;
-  if (!raw || !selAuto || (val !== 0 && val !== 1)) { alert("Automate, adresse et valeur (0/1) requis"); return; }
-  try {
-    const res = await fetch(`${API_BASE}/variables`);
-    const vars = await res.json();
-    const found = vars.find(v => v.address_raw === raw && String(v.automate_id) === String(selAuto));
-    if (!found) { alert("Cette adresse n'est pas enregistrée. Ajoute-la d'abord."); return; }
-    if (found.type !== 'OUTPUT') { alert("Impossible d'écrire sur une entrée."); return; }
-    const r = await fetch(`${API_BASE}/variables/write`, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ id: found.id, value: val })
-    });
-    const j = await r.json();
-    if (j.ok) alert("Écriture OK");
-    else alert("Erreur: " + JSON.stringify(j));
-  } catch (err) {
-    alert("Erreur écriture: " + err.message);
-  }
-};
-
-document.getElementById("btnRefresh").onclick = async () => {
-  await fetch(`${API_BASE}/refresh`, { method: "POST" });
-  alert("Tâches cron rafraîchies");
-};
-
-document.getElementById("btnExport").onclick = () => {
-  const id = document.getElementById("selectVar").value;
-  if (!id) { alert("Choisir une variable pour exporter."); return; }
-  const start = prompt("Date de début (YYYY-MM-DD) - laisser vide pour tout");
-  const end = prompt("Date de fin (YYYY-MM-DD) - laisser vide pour tout");
-  let url = `${API_BASE}/export?id=${encodeURIComponent(id)}`;
-  if (start) url += `&start=${encodeURIComponent(start)}`;
-  if (end) url += `&end=${encodeURIComponent(end)}`;
-  window.location = url;
-};
-
-async function loadChart(id) {
-  if (!id) return;
-  try {
-    const res = await fetch(`${API_BASE}/history/${id}`);
-    const data = await res.json();
-    const labels = data.map(d => new Date(d.timestamp).toLocaleTimeString());
-    const values = data.map(d => d.value);
-    if (!chart) {
-      chart = new Chart(document.getElementById("chart"), {
-        type: "line",
-        data: { labels, datasets: [{ label: "Valeur", data: values, borderColor: "#1d4ed8", backgroundColor: "rgba(29,78,216,0.15)", borderWidth: 2, fill:true, tension:0.2 }] },
-        options: { animation:false, responsive:true, scales: { x:{ title:{display:true, text:"Temps"}}, y:{ title:{display:true, text:"Valeur"}} } }
-      });
-    } else {
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = values;
-      chart.update();
-    }
-  } catch (err) { console.error("loadChart:", err); }
+async function deleteVar(id) {
+  if (!confirm("Supprimer la variable ?")) return;
+  await fetch(`${API}/variables/${id}`, { method:"DELETE" });
+  await refresh();
 }
 
-setInterval(() => {
-  const id = document.getElementById("selectVar").value;
-  if (id) loadChart(id);
-}, 2000);
-
-document.getElementById("selectVar").onchange = (e) => loadChart(e.target.value);
-document.getElementById("selectAutomate").onchange = loadVariables;
-
-loadAutomates();
+document.getElementById("btnRefresh").onclick = refresh;
+setInterval(refresh, 1000);
+refresh();
 </script>
 </body>
 </html>

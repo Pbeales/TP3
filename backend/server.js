@@ -1,274 +1,168 @@
-// backend/server.js
 require("dotenv").config();
 const express = require("express");
-const mysql = require("mysql2/promise");
 const cors = require("cors");
-const bodyParser = require("body-parser");
-const cron = require("node-cron");
+const path = require("path");
 const ModbusRTU = require("modbus-serial");
+const mysql = require("mysql2/promise");
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-const DB_HOST = process.env.DB_HOST || "mariadb";
-const DB_USER = process.env.DB_USER || "root";
-const DB_PASSWORD = process.env.DB_PASSWORD || "root";
-const DB_NAME = process.env.DB_NAME || "supervision";
-const DB_PORT = parseInt(process.env.DB_PORT, 10) || 3306;
-const PORT = parseInt(process.env.PORT, 10) || 3000;
+// ------------------ CONFIG PLC ------------------
+const PLC_IP = process.env.PLC_IP || "172.16.1.24";
+const PLC_PORT = parseInt(process.env.PLC_PORT || "502");
+const MODBUS_ID = parseInt(process.env.MODBUS_ID || "1");
 
-console.log("DB config:", { DB_HOST, DB_USER, DB_NAME, DB_PORT });
+const networkErrors = ["ESOCKETTIMEDOUT", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH"];
 
-// MySQL pool
+// ------------------ DATABASE ------------------
 const db = mysql.createPool({
-  host: DB_HOST,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
-  port: DB_PORT,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+  host: process.env.DB_HOST || "localhost",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "rootpassword",
+  database: process.env.DB_NAME || "supervision",
+  port: parseInt(process.env.DB_PORT || "3306")
 });
 
-// Cache des clients Modbus par automate.id
-const modbusClients = {}; // { [automateId]: { client, lastConnect } }
+// ------------------ MODBUS CLIENT ------------------
+const client = new ModbusRTU();
+let connected = false;
 
-function addressFromRaw(raw) {
-  // attendu: "%Q0.6.5" ou "%I0.5.5"
-  // extraction simple
-  const m = raw.match(/^%([QI])\d*\.(\d+)\.(\d+)$/i);
-  if (!m) return null;
-  const type = m[1].toUpperCase();
-  const byte = parseInt(m[2], 10);
-  const bit = parseInt(m[3], 10);
-  const addr = byte * 8 + bit;
-  return { type: type === "Q" ? "OUTPUT" : "INPUT", modbus_address: addr };
-}
-
-async function getModbusClient(automate) {
-  // automate: { id, ip, port }
-  if (!automate) throw new Error("automate requis");
-  const key = automate.id;
-  if (modbusClients[key] && modbusClients[key].client) {
-    // vérifier connectivité simple
-    try {
-      // ping: readCoils 0,1 - cheap
-      return modbusClients[key].client;
-    } catch (e) {
-      // fallthrough reconnect
+async function connectModbus() {
+  try {
+    await client.connectTCP(PLC_IP, { port: PLC_PORT });
+    client.setID(MODBUS_ID);
+    client.setTimeout(2000);
+    connected = true;
+    console.log(`✔ Modbus connecté à ${PLC_IP}:${PLC_PORT}`);
+  } catch (e) {
+    connected = false;
+    console.error("❌ Erreur Modbus:", e.message);
+    if (e.errno && networkErrors.includes(e.errno)) {
+      console.log("Reconnexion dans 5s...");
+      setTimeout(connectModbus, 5000);
     }
   }
-  // create and connect
-  const client = new ModbusRTU();
-  try {
-    await client.connectTCP(automate.ip, { port: automate.port, timeout: 2000 });
-    client.setID(1);
-    modbusClients[key] = { client, lastConnect: Date.now() };
-    console.log(`Modbus connecté à ${automate.ip}:${automate.port} (id=${key})`);
-    return client;
-  } catch (err) {
-    console.error(`Impossible de connecter Modbus ${automate.ip}:${automate.port} -> ${err.message}`);
-    throw err;
-  }
 }
 
-// saver: insert history
-async function saveHistory(variable_id, value) {
-  try {
-    await db.query("INSERT INTO history (variable_id, value) VALUES (?, ?)", [variable_id, value]);
-  } catch (err) {
-    console.error("Erreur saveHistory:", err.message);
+client.on("error", (err) => {
+  console.error("Modbus client error:", err.message);
+  connected = false;
+  setTimeout(connectModbus, 5000);
+});
+
+connectModbus();
+
+// ------------------ PARSEUR ADRESSES SCHNEIDER ------------------
+function parseAddress(raw) {
+  raw = raw.trim().toUpperCase();
+
+  let m = raw.match(/^%([IQ])(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const X = parseInt(m[2], 10);
+    const Y = parseInt(m[3], 10);
+    const Z = parseInt(m[4], 10);
+    return { kind: "digital", type: m[1] === "I" ? "INPUT" : "OUTPUT", modbus_address: X * 64 + Y * 8 + Z };
   }
+
+  m = raw.match(/^%([IQ])W(\d+)$/);
+  if (m) return { kind: "analog", type: m[1] === "I" ? "ANALOG_INPUT" : "ANALOG_OUTPUT", modbus_address: parseInt(m[2], 10) };
+
+  return null;
 }
 
-// read a single variable live from automate
-async function readVariableLive(variable) {
+// ------------------ LECTURE VARIABLE ------------------
+async function readVariable(v) {
+  if (!connected) return { raw: null, value: null, kind: "error", error: "Modbus non connecté" };
   try {
-    const [automates] = await db.query("SELECT * FROM automates WHERE id = ?", [variable.automate_id]);
-    if (automates.length === 0) throw new Error("Automate introuvable");
-    const automate = automates[0];
-    const client = await getModbusClient(automate);
-    const addr = variable.modbus_address;
-    if (variable.type === "OUTPUT") {
-      // coils
-      const resp = await client.readCoils(addr, 1);
-      return resp.data[0] ? 1 : 0;
-    } else {
-      // INPUT -> discrete inputs
-      const resp = await client.readDiscreteInputs(addr, 1);
-      return resp.data[0] ? 1 : 0;
+    if (v.kind === "digital" && v.type === "INPUT") {
+      const r = await client.readDiscreteInputs(v.modbus_address, 1);
+      console.log(`Lecture digital INPUT coil ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0] ? 1 : 0, kind: "digital" };
     }
+    if (v.kind === "digital" && v.type === "OUTPUT") {
+      const r = await client.readCoils(v.modbus_address, 1);
+      console.log(`Lecture digital OUTPUT coil ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0] ? 1 : 0, kind: "digital" };
+    }
+    if (v.kind === "analog" && v.type === "ANALOG_INPUT") {
+      const r = await client.readInputRegisters(v.modbus_address, 1);
+      console.log(`Lecture analog INPUT reg ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0], kind: "analog" };
+    }
+    if (v.kind === "analog" && v.type === "ANALOG_OUTPUT") {
+      const r = await client.readHoldingRegisters(v.modbus_address, 1);
+      console.log(`Lecture analog OUTPUT reg ${v.modbus_address}:`, r.data[0]);
+      return { raw: r.data[0], value: r.data[0], kind: "analog" };
+    }
+    return { raw: null, value: null, kind: "unknown" };
   } catch (err) {
-    console.error(`readVariableLive id=${variable.id} (${variable.address_raw}):`, err.message);
-    throw err;
+    console.error("Erreur lecture Modbus:", err.message);
+    return { raw: null, value: null, kind: "error", error: err.message };
   }
 }
 
-// write single coil (for OUTPUT variables)
-async function writeVariable(variable_id, value) {
-  try {
-    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [variable_id]);
-    if (vars.length === 0) throw new Error("Variable introuvable");
-    const v = vars[0];
-    if (v.type !== "OUTPUT") throw new Error("Variable non écrivable (pas une sortie)");
-    const client = await getModbusClient({ id: v.automate_id, ip: v.ip, port: v.port });
-    const addr = v.modbus_address;
-    // write single coil (true/false)
-    await client.writeCoil(addr, !!value);
-    // save to history the written state
-    await saveHistory(variable_id, value ? 1 : 0);
-    return { ok: true };
-  } catch (err) {
-    console.error("Erreur writeVariable:", err.message);
-    throw err;
-  }
-}
+// ------------------ FRONTEND ------------------
+app.use(express.static(path.join(__dirname, "./frontend")));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "./frontend/index.html")));
 
-// Cron scheduler - load variables and schedule reads
-let cronJobs = {};
-async function refreshSchedules() {
-  try {
-    // stop all jobs
-    Object.values(cronJobs).forEach((j) => { try { j.stop(); } catch (e) {} });
-  } catch (e) {}
-  cronJobs = {};
-
-  try {
-    const [vars] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id");
-    vars.forEach((v) => {
-      let freq = parseInt(v.frequency, 10);
-      if (!Number.isFinite(freq) || freq <= 0) freq = 5;
-      const interval = `*/${freq} * * * * *`; // every freq seconds
-      try {
-        const job = cron.schedule(interval, async () => {
-          try {
-            const liveVal = await readVariableLive(v).catch(() => null);
-            if (liveVal !== null) {
-              await saveHistory(v.id, liveVal);
-            }
-          } catch (e) {
-            console.error("Erreur lecture cron variable:", e.message);
-          }
-        });
-        cronJobs[v.id] = job;
-      } catch (e) {
-        console.error("Erreur création cron:", e.message);
-      }
-    });
-    console.log("Tâches cron rafraîchies:", Object.keys(cronJobs).length);
-  } catch (err) {
-    console.error("Erreur refreshSchedules:", err.message);
-  }
-}
-
-// --- Routes ---
-
-app.get("/api/health", (req, res) => res.json({ status: "ok", message: "Backend opérationnel" }));
-
-// Automates
-app.get("/api/automates", async (req, res) => {
-  const [rows] = await db.query("SELECT * FROM automates");
-  res.json(rows);
-});
-app.post("/api/automates", async (req, res) => {
-  const { name, ip, port } = req.body;
-  if (!name || !ip) return res.status(400).json({ error: "name & ip requis" });
-  await db.query("INSERT INTO automates (name, ip, port) VALUES (?, ?, ?)", [name, ip, port || 502]);
-  res.json({ ok: true });
+// ------------------ ROUTES API ------------------
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", message: connected ? "Modbus connecté" : "Modbus non connecté" });
 });
 
-// Variables - list
-app.get("/api/variables", async (req, res) => {
-  const [rows] = await db.query("SELECT v.*, a.name as automate_name, a.ip as automate_ip FROM variables v JOIN automates a ON v.automate_id=a.id ORDER BY v.id ASC");
-  res.json(rows);
+app.get("/api/values", async (req, res) => {
+  const [vars] = await db.query("SELECT * FROM variables ORDER BY id ASC");
+  const out = await Promise.all(vars.map(async v => ({ ...v, ...await readVariable(parseAddress(v.address_raw)) })));
+  res.json(out);
 });
 
-// Get single variable history
-app.get("/api/history/:id", async (req, res) => {
-  const id = req.params.id;
-  const [rows] = await db.query("SELECT timestamp, value FROM history WHERE variable_id = ? ORDER BY timestamp ASC", [id]);
-  res.json(rows);
-});
-
-// Add variable (client provides address_raw and type; server computes modbus_address)
 app.post("/api/variables", async (req, res) => {
-  try {
-    const { automate_id, name, address_raw, type, frequency } = req.body;
-    if (!automate_id || !name || !address_raw || !type) return res.status(400).json({ error: "automate_id,name,address_raw,type requis" });
-    const parsed = addressFromRaw(address_raw);
-    if (!parsed) return res.status(400).json({ error: "address_raw format invalide (ex %Q0.6.5)" });
-    const modbus_address = parsed.modbus_address;
-    await db.query("INSERT INTO variables (automate_id, name, address_raw, type, modbus_address, frequency) VALUES (?, ?, ?, ?, ?, ?)",
-      [automate_id, name.trim(), address_raw.trim(), type === "INPUT" ? "INPUT" : "OUTPUT", modbus_address, frequency || 5]);
-    await refreshSchedules();
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("POST /api/variables:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
+  const { name, comment, address_raw } = req.body;
+  const parsed = parseAddress(address_raw);
+  if (!parsed) return res.status(400).json({ error: "Adresse Schneider invalide" });
 
-// Delete variable
-app.delete("/api/variables/:id", async (req, res) => {
-  const id = req.params.id;
-  await db.query("DELETE FROM variables WHERE id = ?", [id]);
-  await refreshSchedules();
+  await db.query(
+    "INSERT INTO variables (name, comment, address_raw, type, modbus_address) VALUES (?,?,?,?,?)",
+    [name, comment || null, address_raw, parsed.type, parsed.modbus_address]
+  );
   res.json({ ok: true });
 });
 
-// Read a variable live (one-shot)
-app.get("/api/variables/read/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const [rows] = await db.query("SELECT v.*, a.ip, a.port FROM variables v JOIN automates a ON v.automate_id=a.id WHERE v.id = ?", [id]);
-    if (rows.length === 0) return res.status(404).json({ error: "Variable introuvable" });
-    const val = await readVariableLive(rows[0]);
-    res.json({ value: val });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.delete("/api/variables/:id", async (req, res) => {
+  await db.query("DELETE FROM variables WHERE id = ?", [req.params.id]);
+  res.json({ ok: true });
 });
 
-// Write a variable (only OUTPUT)
-app.post("/api/variables/write", async (req, res) => {
+app.post("/api/variables/:id/write", async (req, res) => {
+  const { id } = req.params;
+  const { value } = req.body;
+  const [rows] = await db.query("SELECT * FROM variables WHERE id = ?", [id]);
+  if (!rows.length) return res.status(404).json({ error: "Variable non trouvée" });
+
+  const variable = rows[0];
+  const v = parseAddress(variable.address_raw);
+  if (!v) return res.status(400).json({ error: "Adresse Schneider invalide" });
+
+  if (!connected) return res.status(500).json({ error: "Modbus non connecté" });
+
   try {
-    const { id, value } = req.body;
-    if (id == null || value == null) return res.status(400).json({ error: "id & value requis" });
-    await writeVariable(id, value);
+    if (v.kind === "digital" && v.type === "OUTPUT") {
+      await client.writeCoil(v.modbus_address, value ? true : false);
+      console.log(`Écriture coil ${v.modbus_address}:`, value);
+    } else if (v.kind === "analog" && v.type === "ANALOG_OUTPUT") {
+      await client.writeRegister(v.modbus_address, Number(value));
+      console.log(`Écriture reg ${v.modbus_address}:`, value);
+    } else return res.status(400).json({ error: "Impossible d’écrire sur cette variable" });
+
     res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (err) { 
+    console.error("Erreur écriture Modbus:", err.message);
+    res.status(500).json({ error: err.message }); 
   }
 });
 
-// manual refresh
-app.post("/api/refresh", async (req, res) => {
-  try {
-    await refreshSchedules();
-    res.json({ message: "Cron mis à jour" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Start: wait DB ready then run
-const startServer = async () => {
-  let attempts = 0;
-  while (attempts < 10) {
-    try {
-      await db.query("SELECT 1");
-      break;
-    } catch (e) {
-      attempts++;
-      console.log("DB non prête, attente...");
-      await new Promise(r => setTimeout(r, 3000));
-    }
-  }
-  app.listen(PORT, async () => {
-    console.log(`Backend lancé sur 0.0.0.0:${PORT}`);
-    await refreshSchedules();
-  });
-};
-startServer();
+// ------------------ SERVEUR ------------------
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`✔ Backend prêt sur port ${port}`));

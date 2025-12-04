@@ -1,58 +1,74 @@
-// backend/seed.js
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 
-async function runSeed(retries = 10, delayMs = 3000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const conn = await mysql.createConnection({
-        host: process.env.DB_HOST || "localhost",
-        user: process.env.DB_USER || "root",
-        password: process.env.DB_PASSWORD || "root",
-        port: parseInt(process.env.DB_PORT, 10) || 3306
-      });
+(async () => {
+  try {
+    const db = await mysql.createConnection({
+      host: process.env.DB_HOST || "mariadb",
+      user: process.env.DB_USER || "root",
+      password: process.env.DB_PASSWORD || "rootpassword",
+      database: process.env.DB_NAME || "supervision",
+      port: parseInt(process.env.DB_PORT || "3306", 10),
+    });
 
-      await conn.query("CREATE DATABASE IF NOT EXISTS supervision");
-      await conn.query("USE supervision");
+    console.log("Connexion DB OK ✔");
 
-      await conn.query(`CREATE TABLE IF NOT EXISTS variables (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(50) NOT NULL,
-        ip VARCHAR(50) NOT NULL,
-        register_address INT NOT NULL,
-        frequency INT NOT NULL
-      )`);
-
-      await conn.query(`CREATE TABLE IF NOT EXISTS history (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        variable_id INT NOT NULL,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        value FLOAT NOT NULL,
-        FOREIGN KEY (variable_id) REFERENCES variables(id) ON DELETE CASCADE
-      )`);
-
-      const [rows] = await conn.query("SELECT COUNT(*) as c FROM variables");
-      if (rows[0].c === 0) {
-        await conn.query("INSERT INTO variables (name, ip, register_address, frequency) VALUES (?, ?, ?, ?)",
-          ["Température Ligne 1", "192.168.1.10", 40001, 5]);
-        await conn.query("INSERT INTO variables (name, ip, register_address, frequency) VALUES (?, ?, ?, ?)",
-          ["Pression Réservoir", "192.168.1.11", 40002, 10]);
-        console.log("Seed inséré : 2 variables");
-      } else {
-        console.log("Variables déjà présentes, seed ignoré.");
-      }
-      await conn.end();
+    const [check] = await db.query("SELECT COUNT(*) AS c FROM variables");
+    if (check[0].c > 0) {
+      console.log("Des variables existent déjà → seed ignoré.");
+      await db.end();
       return;
-    } catch (err) {
-      console.error(`Tentative ${attempt} - Erreur seed: ${err.message}`);
-      if (attempt < retries) {
-        await new Promise(r => setTimeout(r, delayMs));
-      } else {
-        console.error("Échec du seed après plusieurs tentatives.");
-        process.exit(1);
-      }
     }
-  }
-}
 
-runSeed();
+    console.log("Insertion des variables initiales...");
+
+    // Digital outputs
+    await db.query(
+      `INSERT INTO variables (name, comment, address_raw, type, modbus_address, frequency)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["Voyant Marche Lampes", "Sortie automate", "%Q0.6.5", "OUTPUT", (6 * 8) + 5, 1]
+    );
+    await db.query(
+      `INSERT INTO variables (name, comment, address_raw, type, modbus_address, frequency)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["Voyant Marche Conv. Sécheur", "Sortie automate", "%Q0.6.7", "OUTPUT", (6 * 8) + 7, 1]
+    );
+    await db.query(
+      `INSERT INTO variables (name, comment, address_raw, type, modbus_address, frequency)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["Voyant Marche Conv. Transfert", "Sortie automate", "%Q0.6.9", "OUTPUT", (6 * 8) + 9, 1]
+    );
+
+    // Digital input
+    await db.query(
+      `INSERT INTO variables (name, comment, address_raw, type, modbus_address, frequency)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["Bouton Test Lampe", "Entrée automate", "%I0.5.5", "INPUT", (5 * 8) + 5, 1]
+    );
+
+    // Analog input
+    await db.query(
+      `INSERT INTO variables (name, comment, address_raw, type, modbus_address, frequency, raw_min, raw_max, scale_min, scale_max, unit)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "Température Process",
+        "Entrée 4-20mA",
+        "%IW100",
+        "ANALOG_INPUT",
+        100,
+        1,
+        8000,
+        20000,
+        0,
+        120,
+        "°C",
+      ]
+    );
+
+    console.log("✔ Seed terminé — 5 variables insérées.");
+    await db.end();
+  } catch (err) {
+    console.error("❌ Erreur seed:", err);
+    process.exit(1);
+  }
+})();

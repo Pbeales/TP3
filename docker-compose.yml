@@ -1,21 +1,22 @@
 version: "3.9"
+
 services:
   mariadb:
     image: mariadb:10.11
     container_name: tp2-mariadb
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: supervision
+      MYSQL_ROOT_PASSWORD: rootpassword
     ports:
       - "3307:3306"
     volumes:
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
       - mariadb_data:/var/lib/mysql
     networks:
-      - tp2-net
+      - tp-net
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,17 +28,19 @@ services:
     environment:
       DB_HOST: mariadb
       DB_USER: root
-      DB_PASSWORD: root
+      DB_PASSWORD: rootpassword
       DB_NAME: supervision
       DB_PORT: 3306
       PORT: 3000
+      PLC_IP: 172.16.1.24
+      PLC_PORT: 502
     depends_on:
       mariadb:
         condition: service_healthy
     ports:
       - "3000:3000"
     networks:
-      - tp2-net
+      - tp-net
 
   frontend:
     build: ./frontend
@@ -49,11 +52,11 @@ services:
     ports:
       - "8080:80"
     networks:
-      - tp2-net
+      - tp-net
 
 volumes:
   mariadb_data:
 
 networks:
-  tp2-net:
+  tp-net:
     driver: bridge
