@@ -6,8 +6,8 @@ services:
     container_name: tp2-mariadb
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: supervision
+      MYSQL_ROOT_PASSWORD: rootpassword
     ports:
       - "3307:3306"
     volumes:
@@ -16,7 +16,7 @@ services:
     networks:
       - tp-net
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -28,7 +28,7 @@ services:
     environment:
       DB_HOST: mariadb
       DB_USER: root
-      DB_PASSWORD: root
+      DB_PASSWORD: rootpassword
       DB_NAME: supervision
       DB_PORT: 3306
       PORT: 3000

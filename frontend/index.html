@@ -2,13 +2,14 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Supervision Automate — Variables</title>
+<title>Supervision Automate</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
-body { background:#eef2f7; padding:20px; }
-.box { background:white; padding:20px; border-radius:8px; }
-td, th { text-align:center; vertical-align:middle; }
-.small-muted { font-size:0.85rem; color:#666; }
+body{background:#eef2f7;padding:20px;}
+.box{background:white;padding:20px;border-radius:8px;}
+td,th{text-align:center;vertical-align:middle;}
+.small-muted{font-size:0.85rem;color:#666;}
 </style>
 </head>
 <body>
@@ -18,42 +19,23 @@ td, th { text-align:center; vertical-align:middle; }
   <div class="box mb-4">
     <h5>➕ Ajouter une variable</h5>
     <form id="addForm" class="row g-2 mt-2">
-      <div class="col-md-3">
-        <input id="name" class="form-control" placeholder="Nom (ex: Voyant lampes)" required>
-      </div>
-      <div class="col-md-4">
-        <input id="comment" class="form-control" placeholder="Commentaire (optionnel)">
-      </div>
-      <div class="col-md-3">
-        <input id="address_raw" class="form-control" placeholder="%I0.5.5 / %Q0.6.7 / %IW100" required>
-      </div>
-      <div class="col-md-2">
-        <button class="btn btn-primary w-100">Ajouter</button>
-      </div>
-
-      <div class="col-12 mt-1">
-        <small class="small-muted">Formats acceptés : %I0.5.5, %Q0.6.7 (digital) ; %IW100, %QW20 (analog). Pour analogique, vous pouvez ajouter manuellement raw_min/raw_max/scale_min/scale_max (optionnel).</small>
-      </div>
+      <div class="col-md-3"><input id="name" class="form-control" placeholder="Nom" required></div>
+      <div class="col-md-4"><input id="comment" class="form-control" placeholder="Commentaire (optionnel)"></div>
+      <div class="col-md-3"><input id="address_raw" class="form-control" placeholder="%I0.5.5 / %Q0.6.7 / %IW100" required></div>
+      <div class="col-md-2"><button class="btn btn-primary w-100">Ajouter</button></div>
+      <div class="col-12 mt-1"><small class="small-muted">Formats : %I0.5.5, %Q0.6.7, %IW100, %QW20</small></div>
     </form>
   </div>
 
   <div class="box">
     <div class="d-flex justify-content-between align-items-center mb-2">
       <h5 class="mb-0">📋 Variables en temps réel</h5>
-      <div><button id="btnRefresh" class="btn btn-outline-secondary btn-sm">Rafraîchir</button></div>
+      <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">Rafraîchir</button>
     </div>
 
     <table class="table table-striped">
       <thead class="table-primary">
-        <tr>
-          <th>Nom</th>
-          <th>Commentaire</th>
-          <th>Adresse</th>
-          <th>Type</th>
-          <th>Raw</th>
-          <th>Valeur</th>
-          <th>Action</th>
-        </tr>
+        <tr><th>Nom</th><th>Commentaire</th><th>Adresse</th><th>Type</th><th>Raw</th><th>Valeur</th><th>Action</th></tr>
       </thead>
       <tbody id="tableBody"></tbody>
     </table>
@@ -64,85 +46,61 @@ td, th { text-align:center; vertical-align:middle; }
 const API = `http://${window.location.hostname}:3000/api`;
 
 async function fetchValues() {
-  try {
-    const res = await fetch(`${API}/values`);
-    if (!res.ok) throw new Error("Erreur API");
-    return await res.json();
-  } catch (err) {
-    console.error("fetchValues error:", err);
-    return [];
-  }
+  try { 
+    const res = await fetch(`${API}/values`); 
+    return await res.json(); 
+  } catch { return []; }
+}
+
+function escapeHtml(s) {
+  return s ? String(s).replace(/[&<>"'\/=]/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;', '/':'&#x2F;', '=':'&#x3D;'
+  }[c])) : "";
 }
 
 function renderTable(rows) {
-  const body = document.getElementById("tableBody");
+  const body = document.getElementById("tableBody"); 
   body.innerHTML = "";
   rows.forEach(r => {
     const tr = document.createElement("tr");
-    const raw = (r.raw === null || r.raw === undefined) ? "-" : r.raw;
-    const value = (r.value === null || r.value === undefined) ? "-" : r.value;
-    const error = r.error ? `<br><small class="text-danger">${r.error}</small>` : "";
-    tr.innerHTML = `
-      <td>${escapeHtml(r.name)}</td>
-      <td>${escapeHtml(r.comment || "")}</td>
-      <td>${escapeHtml(r.address_raw)}</td>
-      <td>${escapeHtml(r.type)}</td>
-      <td>${raw}</td>
-      <td>${value}${r.unit ? " " + escapeHtml(r.unit) : ""}${error}</td>
-      <td><button class="btn btn-sm btn-danger" onclick="deleteVar(${r.id})">Suppr</button></td>
-    `;
+    const raw = (r.raw == null) ? "-" : r.raw;
+    const value = (r.value == null) ? "-" : r.value;
+    let displayValue = value;
+    if (r.kind === "digital") displayValue = (r.value === 1 ? "ON" : r.value === 0 ? "OFF" : "-");
+    const errorHtml = r.error ? `<br><small class="text-danger">${escapeHtml(r.error)}</small>` : "";
+    tr.innerHTML = `<td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.comment||"")}</td><td>${escapeHtml(r.address_raw)}</td><td>${escapeHtml(r.type)}</td><td>${raw}</td><td>${displayValue}${r.unit?" "+escapeHtml(r.unit):""}${errorHtml}</td><td><button class="btn btn-sm btn-danger" onclick="deleteVar(${r.id})">Suppr</button></td>`;
     body.appendChild(tr);
   });
 }
 
-async function refresh() {
-  const data = await fetchValues();
-  renderTable(data);
-}
+async function refresh() { renderTable(await fetchValues()); }
 
-document.getElementById("addForm").onsubmit = async (e) => {
+document.getElementById("addForm").onsubmit = async e => {
   e.preventDefault();
   const payload = {
-    name: document.getElementById("name").value,
-    comment: document.getElementById("comment").value,
-    address_raw: document.getElementById("address_raw").value
+    name: document.getElementById("name").value.trim(),
+    comment: document.getElementById("comment").value.trim(),
+    address_raw: document.getElementById("address_raw").value.trim()
   };
-  try {
-    const res = await fetch(`${API}/variables`, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(()=>({}));
-      alert(err.error || "Erreur ajout");
-      return;
-    }
-    e.target.reset();
-    await refresh();
-  } catch (err) {
-    alert("Erreur réseau: " + err.message);
+  const res = await fetch(`${API}/variables`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    alert(err.error || "Erreur ajout");
+    return;
   }
+  e.target.reset();
+  await refresh();
 };
 
 async function deleteVar(id) {
   if (!confirm("Supprimer la variable ?")) return;
-  await fetch(`${API}/variables/${id}`, { method: "DELETE" });
+  await fetch(`${API}/variables/${id}`, { method:"DELETE" });
   await refresh();
 }
 
 document.getElementById("btnRefresh").onclick = refresh;
-
-// auto refresh every 1 second
 setInterval(refresh, 1000);
 refresh();
-
-function escapeHtml(s) {
-  if (s === null || s === undefined) return "";
-  return String(s).replace(/[&<>"'`=\/]/g, function (c) {
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'}[c];
-  });
-}
 </script>
 </body>
 </html>
